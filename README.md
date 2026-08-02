@@ -11,11 +11,13 @@ assembled.
 
 ## Included adapter
 
-`remanence-bru` reads BRU and BRU-PE archives created by our discontinued
-legacy application. It was developed from surviving tapes and dump files after
-the original software was no longer available. The adapter can probe, scan,
-restore, and recover from seekable dumps or physical tape records. It does not
-write BRU archives.
+`remanence-bru` reads uncompressed BRU and BRU-PE archives created by our
+discontinued legacy application. It was developed from surviving tapes and
+dump files after the original software was no longer available. The adapter
+can probe, scan, restore, and recover from seekable dumps or physical tape
+records. It does not write BRU archives. Members marked for BRU's built-in or
+external software compression are detected and rejected before any catalog
+entry or payload is emitted; decompression is not implemented yet.
 
 The stable catalog format ID is `remanence-bru`; the CLI alias is `bru`.
 
@@ -24,7 +26,7 @@ The stable catalog format ID is `remanence-bru`; the CLI alias is `bru`.
 Rust 1.88+ and the Protocol Buffers compiler (`protoc`) on Linux:
 
 ```sh
-cargo build --release
+cargo build --locked --release --workspace
 ```
 
 The build produces `target/release/{rem,rem-debug,rem-daemon}`. These are the
@@ -63,14 +65,17 @@ native-code plugins.
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --release
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo build --locked --release --workspace
 ```
 
 Adapter output should be treated as migration input: verify restored files and
 retain the source media until the destination system's own integrity checks
 have completed.
+
+See [`fixtures/README.md`](fixtures/README.md) for golden-vector provenance,
+independent vendor-reader checks, and the limits of fixture-based validation.
 
 ## License
 

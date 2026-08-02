@@ -31,11 +31,12 @@ const MAGIC_SIZE: usize = 4;
 const MAGIC_ARCHIVE_HEADER: u64 = 0x1234;
 const MAGIC_FILE_HEADER: u64 = 0x2345;
 const MAGIC_CONTINUATION: u64 = 0x3456;
+const MAGIC_ARCHIVE_TERMINATOR: u64 = 0x7890;
 
 const ARTIME_OFFSET: usize = 0x098;
 const BUFSIZE_OFFSET: usize = 0x0A0;
-const RELEASE_MINOR_OFFSET: usize = 0x0B8;
-const RELEASE_MAJOR_OFFSET: usize = 0x0BC;
+const RELEASE_MAJOR_OFFSET: usize = 0x0B8;
+const RELEASE_MINOR_OFFSET: usize = 0x0BC;
 const VARIANT_OFFSET: usize = 0x0C0;
 const ARCHIVE_ID_LOW_OFFSET: usize = 0x0D8;
 const LABEL_OFFSET: usize = 0x1D0;
@@ -48,7 +49,12 @@ const INLINE_DATA_LEN_OFFSET: usize = 0x0DC;
 const INLINE_DATA_OFFSET: usize = 0x400;
 const ST_MODE_OFFSET: usize = 0x180;
 const ST_SIZE_OFFSET: usize = 0x1B8;
+const FILE_FLAGS_OFFSET: usize = 0x1D8;
 const SIZE_HIGH_OFFSET: usize = 0x278;
+
+const FILE_FLAG_EXTERNAL_COMPRESSION: u64 = 0x008;
+const FILE_FLAG_BUILTIN_COMPRESSION: u64 = 0x100;
+const FILE_COMPRESSION_MASK: u64 = FILE_FLAG_EXTERNAL_COMPRESSION | FILE_FLAG_BUILTIN_COMPRESSION;
 
 const CONTINUATION_DLEN_OFFSET: usize = 0x0DC;
 const CONTINUATION_DATA_OFFSET: usize = 0x100;
@@ -94,6 +100,21 @@ pub struct BruFileHeader {
     pub kind: EntryKind,
     /// Raw POSIX mode bits.
     pub mode: u64,
+    /// Compression recorded for this member.
+    pub compression: BruCompression,
+}
+
+/// Compression mode recorded in a BRU file header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BruCompression {
+    /// The member payload is stored without software compression.
+    None,
+    /// The member uses BRU's built-in compressor.
+    BuiltIn,
+    /// The member uses an external compressor selected by BRU.
+    External,
+    /// The member sets more than one compression flag.
+    Ambiguous,
 }
 
 /// BRU format driver.
@@ -551,7 +572,10 @@ impl BruBlockSource for PhysicalBruBlockSource<'_> {
 fn recoverable_transferred_bytes(error: &TapeIoError, buffer_len: usize) -> Option<usize> {
     let transferred = match error {
         TapeIoError::CheckCondition(error) => check_condition_transferred_bytes(error)?,
-        TapeIoError::ReadBufferTooSmall { provided, .. } => *provided as usize,
+        // `provided` is the caller's buffer capacity, not a count of bytes
+        // written before the error. The tape contract does not guarantee that
+        // any part of the buffer was initialized on this path.
+        TapeIoError::ReadBufferTooSmall { .. } => 0,
         _ => return None,
     };
     Some(transferred.min(buffer_len))
@@ -749,6 +773,12 @@ fn walk_archive(
             break;
         };
         let header = parse_file_header(&block.data)?;
+        if header.compression != BruCompression::None {
+            return Err(FormatError::unsupported(format!(
+                "BRU member {} uses {:?} software compression",
+                header.path, header.compression
+            )));
+        }
         let entry = normalized_entry(block.offset, &header);
         visitor.entry(&entry)?;
         pending_block = stream_entry_body(source, visitor, &entry, &header, &block)?;
@@ -769,6 +799,9 @@ fn file_header_or_resync(
     if block.status == BruBlockStatus::ReadError {
         visitor.archive_gap(&archive_gap_range(&block, ArchiveGapCause::ReadError))?;
         return resync_to_file_header(source, visitor);
+    }
+    if is_archive_terminator(&block) {
+        return Ok(None);
     }
     if is_resync_file_header(&block) {
         Ok(Some(block))
@@ -794,12 +827,22 @@ fn resync_to_file_header(
             visitor.archive_gap(&archive_gap_range(&block, ArchiveGapCause::ReadError))?;
             continue;
         }
+        if is_archive_terminator(&block) {
+            return Ok(None);
+        }
         if is_resync_file_header(&block) {
             return Ok(Some(block));
         }
         visitor.archive_gap(&archive_gap_range(&block, ArchiveGapCause::Resync))?;
     }
     Ok(None)
+}
+
+fn is_archive_terminator(block: &BruBlock) -> bool {
+    matches!(
+        block.status,
+        BruBlockStatus::Ok | BruBlockStatus::ReadErrorData
+    ) && read_magic(&block.data).ok() == Some(MAGIC_ARCHIVE_TERMINATOR)
 }
 
 fn is_resync_file_header(block: &BruBlock) -> bool {
@@ -1161,6 +1204,12 @@ fn parse_file_header(block: &[u8; BRU_BLOCK_SIZE]) -> Result<BruFileHeader, Form
     };
     let size_low = read_hex_u64(block, ST_SIZE_OFFSET, 8)?;
     let size_high = read_hex_u64(block, SIZE_HIGH_OFFSET, 8)?;
+    let compression = match read_hex_u64(block, FILE_FLAGS_OFFSET, 8)? & FILE_COMPRESSION_MASK {
+        0 => BruCompression::None,
+        FILE_FLAG_BUILTIN_COMPRESSION => BruCompression::BuiltIn,
+        FILE_FLAG_EXTERNAL_COMPRESSION => BruCompression::External,
+        _ => BruCompression::Ambiguous,
+    };
     Ok(BruFileHeader {
         sequence: read_hex_u64(block, FILE_SEQUENCE_OFFSET, 8)?,
         path,
@@ -1168,6 +1217,7 @@ fn parse_file_header(block: &[u8; BRU_BLOCK_SIZE]) -> Result<BruFileHeader, Form
         size_bytes: (size_high << 32) | size_low,
         kind,
         mode,
+        compression,
     })
 }
 
@@ -1300,6 +1350,8 @@ mod tests {
         assert_eq!(header.archive_id, "4de47d2661a8");
         assert_eq!(header.label, "TEST");
         assert_eq!(header.buffer_size_bytes, 1024 * 1024);
+        assert_eq!(header.release_major, 17);
+        assert_eq!(header.release_minor, 1);
     }
 
     #[test]
@@ -1325,6 +1377,55 @@ mod tests {
         assert_eq!(sink.damages[0].start, 2);
         assert_eq!(sink.damages[0].end, 5);
         assert_eq!(sink.damages[0].status, DamageStatus::ChecksumFailed);
+    }
+
+    #[test]
+    fn rejects_compressed_members_before_emitting_catalog_or_payload() {
+        for (flag, expected) in [
+            (FILE_FLAG_BUILTIN_COMPRESSION, "BuiltIn"),
+            (FILE_FLAG_EXTERNAL_COMPRESSION, "External"),
+            (FILE_COMPRESSION_MASK, "Ambiguous"),
+        ] {
+            let mut header = file_header_block(1, "compressed.bin", 3, b"abc");
+            put_hex(&mut header, FILE_FLAGS_OFFSET, 8, flag);
+            let dump = [
+                archive_block().as_slice(),
+                finalize_block(header).as_slice(),
+            ]
+            .concat();
+
+            let mut scan_reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump.clone()));
+            let mut catalog = CatalogSink::default();
+            let scan_error = scan_reader.scan(&mut catalog).unwrap_err();
+            assert!(scan_error.to_string().contains(expected));
+            assert!(catalog.entries.is_empty());
+
+            let mut stream_reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump));
+            let mut events = EventSink::default();
+            let stream_error = stream_reader.stream_all(&mut events).unwrap_err();
+            assert!(stream_error.to_string().contains(expected));
+            assert!(events.entries.is_empty());
+            assert!(events.data.is_empty());
+        }
+    }
+
+    #[test]
+    fn accepts_a_valid_archive_terminator_without_reporting_a_gap() {
+        let dump = [
+            archive_block().as_slice(),
+            file_header_block(1, "file.bin", 3, b"abc").as_slice(),
+            archive_terminator_block().as_slice(),
+        ]
+        .concat();
+        let mut reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump));
+        let mut sink = EventSink::default();
+
+        let report = reader.stream_all(&mut sink).unwrap();
+
+        assert_eq!(report.entries, 1);
+        assert_eq!(report.bytes, 3);
+        assert_eq!(report.archive_gaps, 0);
+        assert_eq!(sink.data, b"abc");
     }
 
     #[test]
@@ -1456,6 +1557,32 @@ mod tests {
         assert_eq!(sink.entries[0].kind, EntryKind::Directory);
         assert_eq!(sink.entries[1].path, "file.bin");
         assert_eq!(sink.entries[1].size_bytes, Some(3));
+    }
+
+    #[test]
+    fn vendor_validated_fixture_covers_utf8_long_paths_and_continuations() {
+        let fixture = include_bytes!("../../../fixtures/reference-edge.bru");
+        let mut reader = BruFormat.open_dump_reader(std::io::Cursor::new(fixture.as_slice()));
+        let mut sink = EventSink::default();
+
+        let report = reader.stream_all(&mut sink).unwrap();
+
+        assert_eq!(report.entries, 2);
+        assert_eq!(report.bytes, 2000);
+        assert_eq!(report.damage_events, 0);
+        assert_eq!(report.archive_gaps, 0);
+        assert_eq!(sink.entries[0].path, "café");
+        assert_eq!(sink.entries[0].kind, EntryKind::Directory);
+        assert_eq!(sink.entries[1].path.len(), 121);
+        assert!(sink.entries[1].path.starts_with("archive/"));
+        assert!(sink.entries[1].path.ends_with(".bin"));
+        assert_eq!(sink.data.len(), 2000);
+        assert_eq!(
+            sink.data,
+            (0..2000)
+                .map(|index| ((index * 37 + 11) % 256) as u8)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1766,6 +1893,43 @@ mod tests {
         assert_eq!(sink.entries[1].path, "second.bin");
     }
 
+    #[test]
+    fn physical_reader_does_not_reuse_stale_bytes_after_buffer_too_small() {
+        let records = vec![
+            archive_block().to_vec(),
+            file_header_block(1, "first.bin", 5, b"ab").to_vec(),
+            vec![0; BRU_BLOCK_SIZE],
+            file_header_block(2, "second.bin", 3, b"two").to_vec(),
+        ];
+        let mut source = AdvancingBufferTooSmallSource {
+            inner: FakePhysicalSource::new(records),
+            fail_at: 2,
+            failed: false,
+        };
+        let mut sink = EventSink::default();
+        let probe = ProbeResult {
+            format_id: BruFormat.id().to_string(),
+            confidence: ProbeConfidence::Certain,
+            source_requirement: SourceRequirement::PhysicalTapeRecords,
+            adapter_state: Vec::new(),
+        };
+
+        let report = {
+            let mut reader = BruFormat.open_tape_reader(&mut source, &probe).unwrap();
+            reader.stream_all(&mut sink).unwrap()
+        };
+
+        assert_eq!(report.entries, 2);
+        assert_eq!(report.bytes, 5);
+        assert_eq!(report.damage_events, 1);
+        assert_eq!(report.archive_gaps, 1);
+        assert_eq!(sink.data, b"abtwo");
+        assert_eq!(sink.entries[0].path, "first.bin");
+        assert_eq!(sink.entries[1].path, "second.bin");
+        assert_eq!(sink.damages[0].status, DamageStatus::ReadError);
+        assert_eq!(sink.archive_gaps[0].cause, ArchiveGapCause::ReadError);
+    }
+
     struct FakePhysicalSource {
         records: Vec<Vec<u8>>,
         next_record: usize,
@@ -1859,6 +2023,46 @@ mod tests {
         transferred: Vec<u8>,
     }
 
+    struct AdvancingBufferTooSmallSource {
+        inner: FakePhysicalSource,
+        fail_at: usize,
+        failed: bool,
+    }
+
+    impl PhysicalTapeSource for AdvancingBufferTooSmallSource {
+        fn configure_block_size(&mut self, block_size: BlockSize) -> Result<(), TapeIoError> {
+            self.inner.configure_block_size(block_size)
+        }
+
+        fn locate_physical(
+            &mut self,
+            position: PhysicalTapePosition,
+        ) -> Result<PhysicalTapePosition, TapeIoError> {
+            self.inner.locate_physical(position)
+        }
+
+        fn space_filemarks(&mut self, count: i64) -> Result<PhysicalFilemarkSpace, TapeIoError> {
+            self.inner.space_filemarks(count)
+        }
+
+        fn read_record(&mut self, buf: &mut [u8]) -> Result<PhysicalReadOutcome, TapeIoError> {
+            if !self.failed && self.inner.next_record == self.fail_at {
+                self.failed = true;
+                self.inner.next_record += 1;
+                self.inner.position = PhysicalTapePosition::new(self.inner.next_record as u64);
+                return Err(TapeIoError::ReadBufferTooSmall {
+                    actual: (buf.len() + 1) as u32,
+                    provided: buf.len() as u32,
+                });
+            }
+            self.inner.read_record(buf)
+        }
+
+        fn position(&mut self) -> Result<PhysicalTapePosition, TapeIoError> {
+            self.inner.position()
+        }
+    }
+
     impl PhysicalTapeSource for AdvancingReadErrorSource {
         fn configure_block_size(&mut self, block_size: BlockSize) -> Result<(), TapeIoError> {
             self.inner.configure_block_size(block_size)
@@ -1914,8 +2118,8 @@ mod tests {
         put_hex(&mut block, MAGIC_OFFSET, MAGIC_SIZE, MAGIC_ARCHIVE_HEADER);
         put_hex(&mut block, ARTIME_OFFSET, 8, 0x4DE47D26);
         put_hex(&mut block, BUFSIZE_OFFSET, 8, 1024 * 1024);
-        put_hex(&mut block, RELEASE_MINOR_OFFSET, 4, 17);
-        put_hex(&mut block, RELEASE_MAJOR_OFFSET, 4, 1);
+        put_hex(&mut block, RELEASE_MAJOR_OFFSET, 4, 17);
+        put_hex(&mut block, RELEASE_MINOR_OFFSET, 4, 1);
         put_hex(&mut block, VARIANT_OFFSET, 4, 0);
         put_hex(&mut block, ARCHIVE_ID_LOW_OFFSET, 4, 0x61A8);
         put_ascii(&mut block, LABEL_OFFSET, "TEST");
@@ -1956,6 +2160,17 @@ mod tests {
         put_hex(&mut block, CONTINUATION_DLEN_OFFSET, 4, data.len() as u64);
         block[CONTINUATION_DATA_OFFSET..CONTINUATION_DATA_OFFSET + data.len()]
             .copy_from_slice(data);
+        finalize_block(block)
+    }
+
+    fn archive_terminator_block() -> [u8; BRU_BLOCK_SIZE] {
+        let mut block = [0; BRU_BLOCK_SIZE];
+        put_hex(
+            &mut block,
+            MAGIC_OFFSET,
+            MAGIC_SIZE,
+            MAGIC_ARCHIVE_TERMINATOR,
+        );
         finalize_block(block)
     }
 }

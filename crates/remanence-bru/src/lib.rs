@@ -15,7 +15,8 @@ use remanence_format_driver::{
     ProbeResult, ReadSeek, ScanIntegrityBasis, ScanReport, SourceRequirement, StreamReport,
 };
 use remanence_library::{
-    BlockSize, PhysicalReadOutcome, PhysicalTapePosition, PhysicalTapeSource, TapeIoError,
+    BlockSize, PhysicalReadOutcome, PhysicalTapePosition, PhysicalTapeSource, ScsiError,
+    TapeIoError,
 };
 
 /// BRU logical block size in bytes.
@@ -317,7 +318,10 @@ impl<S: BruBlockSource> BruArchiveReader<S> {
             .source
             .next_block()?
             .ok_or_else(|| FormatError::Parse("missing BRU archive header".to_string()))?;
-        if block.status != BruBlockStatus::Ok {
+        if !matches!(
+            block.status,
+            BruBlockStatus::Ok | BruBlockStatus::ReadErrorData
+        ) {
             return Err(FormatError::Parse(
                 "BRU archive header checksum failed".to_string(),
             ));
@@ -399,8 +403,17 @@ struct PhysicalBruBlockSource<'a> {
     record: Vec<u8>,
     record_pos: usize,
     record_len: usize,
+    record_read_error: bool,
+    record_source_state: Vec<u8>,
     logical_offset: u64,
     physical_position: Option<PhysicalTapePosition>,
+    pending_read_error: Option<PendingPhysicalReadError>,
+}
+
+struct PendingPhysicalReadError {
+    position_before: PhysicalTapePosition,
+    position_after: PhysicalTapePosition,
+    diagnostic: String,
 }
 
 impl<'a> PhysicalBruBlockSource<'a> {
@@ -410,8 +423,11 @@ impl<'a> PhysicalBruBlockSource<'a> {
             record: vec![0; PHYSICAL_READ_BUFFER_BYTES],
             record_pos: 0,
             record_len: 0,
+            record_read_error: false,
+            record_source_state: Vec::new(),
             logical_offset: 0,
             physical_position: None,
+            pending_read_error: None,
         }
     }
 }
@@ -430,12 +446,34 @@ impl BruBlockSource for PhysicalBruBlockSource<'_> {
                     .logical_offset
                     .checked_add(BRU_BLOCK_SIZE as u64)
                     .ok_or_else(|| FormatError::Parse("BRU logical offset overflow".to_string()))?;
-                return Ok(Some(BruBlock::new(offset, data)));
+                let mut block = BruBlock::new(offset, data);
+                if self.record_read_error {
+                    if block.status == BruBlockStatus::Ok {
+                        block.status = BruBlockStatus::ReadErrorData;
+                    }
+                    block.source_state = self.record_source_state.clone();
+                }
+                return Ok(Some(block));
             }
             if self.record_pos != self.record_len {
                 return Err(FormatError::Parse(format!(
                     "BRU physical record length {} is not a multiple of {}",
                     self.record_len, BRU_BLOCK_SIZE
+                )));
+            }
+            if let Some(pending) = self.pending_read_error.take() {
+                self.record_read_error = false;
+                self.record_source_state.clear();
+                let offset = self.logical_offset;
+                self.logical_offset = self
+                    .logical_offset
+                    .checked_add(BRU_BLOCK_SIZE as u64)
+                    .ok_or_else(|| FormatError::Parse("BRU logical offset overflow".to_string()))?;
+                return Ok(Some(BruBlock::read_error(
+                    offset,
+                    pending.position_before,
+                    pending.position_after,
+                    &pending.diagnostic,
                 )));
             }
 
@@ -449,9 +487,11 @@ impl BruBlockSource for PhysicalBruBlockSource<'_> {
             };
             match self.source.read_record(&mut self.record) {
                 Err(error) => {
-                    if !recoverable_advancing_read_error(&error) {
+                    let Some(transferred_bytes) =
+                        recoverable_transferred_bytes(&error, self.record.len())
+                    else {
                         return Err(error.into());
-                    }
+                    };
                     let Ok(position_after) = self.source.position() else {
                         return Err(error.into());
                     };
@@ -461,19 +501,21 @@ impl BruBlockSource for PhysicalBruBlockSource<'_> {
                         return Err(error.into());
                     }
                     self.physical_position = Some(position_after);
-                    let offset = self.logical_offset;
-                    self.logical_offset = self
-                        .logical_offset
-                        .checked_add(BRU_BLOCK_SIZE as u64)
-                        .ok_or_else(|| {
-                            FormatError::Parse("BRU logical offset overflow".to_string())
-                        })?;
-                    return Ok(Some(BruBlock::read_error(
-                        offset,
+                    let complete_bru_bytes = transferred_bytes - transferred_bytes % BRU_BLOCK_SIZE;
+                    let diagnostic = format!(
+                        "{error}; bytes_transferred={transferred_bytes}; complete_bru_bytes={complete_bru_bytes}"
+                    );
+                    self.record_pos = 0;
+                    self.record_len = complete_bru_bytes;
+                    self.record_read_error = true;
+                    self.record_source_state =
+                        physical_read_state(position_before, position_after, &diagnostic);
+                    self.pending_read_error = Some(PendingPhysicalReadError {
                         position_before,
                         position_after,
-                        &error.to_string(),
-                    )));
+                        diagnostic,
+                    });
+                    continue;
                 }
                 Ok(PhysicalReadOutcome::Data { bytes: 0, .. }) => {
                     return Err(FormatError::Parse(
@@ -493,6 +535,8 @@ impl BruBlockSource for PhysicalBruBlockSource<'_> {
                     self.physical_position = Some(position_after);
                     self.record_pos = 0;
                     self.record_len = bytes;
+                    self.record_read_error = false;
+                    self.record_source_state.clear();
                 }
                 Ok(PhysicalReadOutcome::Filemark { position_after })
                 | Ok(PhysicalReadOutcome::EndOfData { position_after }) => {
@@ -504,11 +548,31 @@ impl BruBlockSource for PhysicalBruBlockSource<'_> {
     }
 }
 
-fn recoverable_advancing_read_error(error: &TapeIoError) -> bool {
-    matches!(
-        error,
-        TapeIoError::CheckCondition(_) | TapeIoError::ReadBufferTooSmall { .. }
-    )
+fn recoverable_transferred_bytes(error: &TapeIoError, buffer_len: usize) -> Option<usize> {
+    let transferred = match error {
+        TapeIoError::CheckCondition(error) => check_condition_transferred_bytes(error)?,
+        TapeIoError::ReadBufferTooSmall { provided, .. } => *provided as usize,
+        _ => return None,
+    };
+    Some(transferred.min(buffer_len))
+}
+
+fn check_condition_transferred_bytes(error: &ScsiError) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let ScsiError::CheckCondition {
+            bytes_transferred, ..
+        } = error
+        else {
+            return None;
+        };
+        Some(*bytes_transferred as usize)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = error;
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,6 +580,7 @@ enum BruBlockStatus {
     Ok,
     ChecksumFailed,
     Partial,
+    ReadErrorData,
     ReadError,
 }
 
@@ -560,20 +625,28 @@ impl BruBlock {
         position_after: PhysicalTapePosition,
         diagnostic: &str,
     ) -> Self {
-        let mut source_state = Vec::with_capacity(32 + diagnostic.len());
-        source_state.extend_from_slice(&position_before.partition.to_le_bytes());
-        source_state.extend_from_slice(&position_before.lba.to_le_bytes());
-        source_state.extend_from_slice(&position_after.partition.to_le_bytes());
-        source_state.extend_from_slice(&position_after.lba.to_le_bytes());
-        source_state.extend_from_slice(diagnostic.as_bytes());
         Self {
             offset,
             data: [0; BRU_BLOCK_SIZE],
             valid_len: BRU_BLOCK_SIZE,
             status: BruBlockStatus::ReadError,
-            source_state,
+            source_state: physical_read_state(position_before, position_after, diagnostic),
         }
     }
+}
+
+fn physical_read_state(
+    position_before: PhysicalTapePosition,
+    position_after: PhysicalTapePosition,
+    diagnostic: &str,
+) -> Vec<u8> {
+    let mut state = Vec::with_capacity(32 + diagnostic.len());
+    state.extend_from_slice(&position_before.partition.to_le_bytes());
+    state.extend_from_slice(&position_before.lba.to_le_bytes());
+    state.extend_from_slice(&position_after.partition.to_le_bytes());
+    state.extend_from_slice(&position_after.lba.to_le_bytes());
+    state.extend_from_slice(diagnostic.as_bytes());
+    state
 }
 
 trait BruVisitor {
@@ -655,7 +728,10 @@ fn walk_archive(
     if archive_block.status == BruBlockStatus::Partial {
         return Err(FormatError::TruncatedPayload);
     }
-    if archive_block.status != BruBlockStatus::Ok {
+    if !matches!(
+        archive_block.status,
+        BruBlockStatus::Ok | BruBlockStatus::ReadErrorData
+    ) {
         return Err(FormatError::Parse(
             "BRU archive header checksum failed".to_string(),
         ));
@@ -727,8 +803,10 @@ fn resync_to_file_header(
 }
 
 fn is_resync_file_header(block: &BruBlock) -> bool {
-    block.status == BruBlockStatus::Ok
-        && matches!(read_magic(&block.data), Ok(MAGIC_FILE_HEADER))
+    matches!(
+        block.status,
+        BruBlockStatus::Ok | BruBlockStatus::ReadErrorData
+    ) && matches!(read_magic(&block.data), Ok(MAGIC_FILE_HEADER))
         && parse_file_header(&block.data).is_ok()
 }
 
@@ -759,12 +837,12 @@ fn stream_entry_body(
     }
     if inline_len > 0 {
         let end = INLINE_DATA_OFFSET + inline_len as usize;
-        if header_block.status != BruBlockStatus::Ok {
+        if let Some(status) = payload_damage_status(header_block.status) {
             visitor.damage(&damage_range(
                 &entry.file_id,
                 position,
                 position + inline_len,
-                DamageStatus::ChecksumFailed,
+                status,
                 Some(header_block.offset),
             ))?;
         }
@@ -833,12 +911,12 @@ fn stream_entry_body(
                 visitor, entry, header, position, block,
             );
         }
-        if block.status != BruBlockStatus::Ok {
+        if let Some(status) = payload_damage_status(block.status) {
             visitor.damage(&damage_range(
                 &entry.file_id,
                 position,
                 position + dlen,
-                DamageStatus::ChecksumFailed,
+                status,
                 Some(block.offset),
             ))?;
         }
@@ -847,6 +925,16 @@ fn stream_entry_body(
         position += dlen;
     }
     Ok(None)
+}
+
+fn payload_damage_status(status: BruBlockStatus) -> Option<DamageStatus> {
+    match status {
+        BruBlockStatus::Ok => None,
+        BruBlockStatus::ChecksumFailed | BruBlockStatus::Partial => {
+            Some(DamageStatus::ChecksumFailed)
+        }
+        BruBlockStatus::ReadErrorData | BruBlockStatus::ReadError => Some(DamageStatus::ReadError),
+    }
 }
 
 fn stream_partial_continuation(
@@ -871,7 +959,14 @@ fn stream_partial_continuation(
         return Ok(None);
     }
 
-    let dlen = read_hex_u64(&block.data, CONTINUATION_DLEN_OFFSET, 4)?;
+    let dlen = match read_hex_u64(&block.data, CONTINUATION_DLEN_OFFSET, 4) {
+        Ok(dlen) => dlen,
+        Err(_) => {
+            return abort_entry_body_after_bad_continuation(
+                visitor, entry, header, position, block,
+            );
+        }
+    };
     let remaining = header.size_bytes - position;
     if dlen == 0 || dlen > 1792 || dlen > remaining {
         return abort_entry_body_after_bad_continuation(visitor, entry, header, position, block);
@@ -1124,7 +1219,7 @@ fn io_to_format(context: impl Into<String>, source: io::Error) -> FormatError {
 mod tests {
     use super::*;
 
-    use remanence_library::{PhysicalFilemarkSpace, ScsiError};
+    use remanence_library::PhysicalFilemarkSpace;
 
     #[derive(Default)]
     struct CatalogSink {
@@ -1310,6 +1405,37 @@ mod tests {
         assert_eq!(sink.damages[1].start, 3);
         assert_eq!(sink.damages[1].end, 5);
         assert_eq!(sink.damages[1].status, DamageStatus::Missing);
+    }
+
+    #[test]
+    fn malformed_length_in_partial_continuation_is_nonfatal() {
+        let mut continuation = continuation_block(b"cde");
+        continuation[CONTINUATION_DLEN_OFFSET..CONTINUATION_DLEN_OFFSET + 4]
+            .copy_from_slice(b"zzzz");
+        let mut dump = [
+            archive_block().as_slice(),
+            file_header_block(1, "file.bin", 5, b"ab").as_slice(),
+        ]
+        .concat();
+        dump.extend_from_slice(&continuation[..CONTINUATION_DATA_OFFSET]);
+        let mut reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump));
+        let mut sink = EventSink::default();
+
+        let report = reader.stream_all(&mut sink).unwrap();
+
+        assert_eq!(report.entries, 1);
+        assert_eq!(report.bytes, 2);
+        assert_eq!(report.damage_events, 1);
+        assert_eq!(report.archive_gaps, 1);
+        assert_eq!(sink.data, b"ab");
+        assert_eq!(sink.damages[0].start, 2);
+        assert_eq!(sink.damages[0].end, 5);
+        assert_eq!(sink.damages[0].status, DamageStatus::Missing);
+        assert_eq!(
+            sink.archive_gaps[0].cause,
+            ArchiveGapCause::UnrecognizedData
+        );
+        assert_eq!(sink.ended, vec![FileId("bru:1".to_string())]);
     }
 
     #[test]
@@ -1574,6 +1700,7 @@ mod tests {
             inner: FakePhysicalSource::new(records),
             fail_at: 2,
             failed: false,
+            transferred: Vec::new(),
         };
         let mut sink = EventSink::default();
         let probe = ProbeResult {
@@ -1593,6 +1720,45 @@ mod tests {
         assert_eq!(report.damage_events, 1);
         assert_eq!(report.archive_gaps, 1);
         assert_eq!(sink.data, b"abtwo");
+        assert_eq!(sink.damages[0].start, 2);
+        assert_eq!(sink.damages[0].end, 5);
+        assert_eq!(sink.damages[0].status, DamageStatus::ReadError);
+        assert_eq!(sink.archive_gaps[0].cause, ArchiveGapCause::ReadError);
+        assert_eq!(sink.entries[1].path, "second.bin");
+    }
+
+    #[test]
+    fn physical_reader_preserves_complete_blocks_transferred_before_read_error() {
+        let records = vec![
+            archive_block().to_vec(),
+            file_header_block(1, "first.bin", 5, b"ab").to_vec(),
+            vec![0; BRU_BLOCK_SIZE],
+            file_header_block(2, "second.bin", 3, b"two").to_vec(),
+        ];
+        let mut source = AdvancingReadErrorSource {
+            inner: FakePhysicalSource::new(records),
+            fail_at: 2,
+            failed: false,
+            transferred: continuation_block(b"cde").to_vec(),
+        };
+        let mut sink = EventSink::default();
+        let probe = ProbeResult {
+            format_id: BruFormat.id().to_string(),
+            confidence: ProbeConfidence::Certain,
+            source_requirement: SourceRequirement::PhysicalTapeRecords,
+            adapter_state: Vec::new(),
+        };
+
+        let report = {
+            let mut reader = BruFormat.open_tape_reader(&mut source, &probe).unwrap();
+            reader.stream_all(&mut sink).unwrap()
+        };
+
+        assert_eq!(report.entries, 2);
+        assert_eq!(report.bytes, 8);
+        assert_eq!(report.damage_events, 1);
+        assert_eq!(report.archive_gaps, 1);
+        assert_eq!(sink.data, b"abcdetwo");
         assert_eq!(sink.damages[0].start, 2);
         assert_eq!(sink.damages[0].end, 5);
         assert_eq!(sink.damages[0].status, DamageStatus::ReadError);
@@ -1690,6 +1856,7 @@ mod tests {
         inner: FakePhysicalSource,
         fail_at: usize,
         failed: bool,
+        transferred: Vec<u8>,
     }
 
     impl PhysicalTapeSource for AdvancingReadErrorSource {
@@ -1711,11 +1878,13 @@ mod tests {
         fn read_record(&mut self, buf: &mut [u8]) -> Result<PhysicalReadOutcome, TapeIoError> {
             if !self.failed && self.inner.next_record == self.fail_at {
                 self.failed = true;
+                assert!(self.transferred.len() <= buf.len());
+                buf[..self.transferred.len()].copy_from_slice(&self.transferred);
                 self.inner.next_record += 1;
                 self.inner.position = PhysicalTapePosition::new(self.inner.next_record as u64);
                 return Err(TapeIoError::CheckCondition(ScsiError::CheckCondition {
                     sense: vec![0x70, 0, 0x03, 0, 0, 0, 0, 0x0a],
-                    bytes_transferred: 0,
+                    bytes_transferred: self.transferred.len() as u32,
                 }));
             }
             self.inner.read_record(buf)

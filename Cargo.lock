@@ -1910,7 +1910,7 @@ dependencies = [
 [[package]]
 name = "remanence-aead"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "chacha20 0.9.1",
  "chacha20poly1305",
@@ -1929,7 +1929,7 @@ dependencies = [
 [[package]]
 name = "remanence-api"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "ciborium",
  "hyper-util",
@@ -1973,7 +1973,7 @@ dependencies = [
 [[package]]
 name = "remanence-chaos"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "remanence-library",
  "remanence-scsi",
@@ -1988,7 +1988,7 @@ dependencies = [
 [[package]]
 name = "remanence-cli"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "base64",
  "ciborium",
@@ -2021,12 +2021,12 @@ dependencies = [
 [[package]]
 name = "remanence-crc"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 
 [[package]]
 name = "remanence-daemon"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "base64",
  "clap",
@@ -2046,7 +2046,7 @@ dependencies = [
 [[package]]
 name = "remanence-format"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "ciborium",
  "remanence-aead",
@@ -2060,7 +2060,7 @@ dependencies = [
 [[package]]
 name = "remanence-format-driver"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "remanence-aead",
  "remanence-library",
@@ -2070,7 +2070,7 @@ dependencies = [
 [[package]]
 name = "remanence-library"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "libc",
  "remanence-scsi",
@@ -2081,7 +2081,7 @@ dependencies = [
 [[package]]
 name = "remanence-parity"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "ciborium",
  "hmac",
@@ -2099,7 +2099,7 @@ dependencies = [
 [[package]]
 name = "remanence-scsi"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "bytes",
  "nix",
@@ -2109,7 +2109,7 @@ dependencies = [
 [[package]]
 name = "remanence-state"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "ciborium",
  "nix",
@@ -2130,7 +2130,7 @@ dependencies = [
 [[package]]
 name = "remanence-stream"
 version = "1.0.0"
-source = "git+https://github.com/archivetechie/remanence?rev=04d04d28b3a917642c275be5f3fbae4449bf4552#04d04d28b3a917642c275be5f3fbae4449bf4552"
+source = "git+https://github.com/archivetechie/remanence?rev=f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84#f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84"
 dependencies = [
  "nix",
  "remanence-format",

@@ -14,10 +14,10 @@ license = "Apache-2.0"
 repository = "https://github.com/archivetechie/remanence-adaptors"
 
 [workspace.dependencies]
-remanence-cli = { git = "https://github.com/archivetechie/remanence", rev = "04d04d28b3a917642c275be5f3fbae4449bf4552" }
-remanence-daemon = { git = "https://github.com/archivetechie/remanence", rev = "04d04d28b3a917642c275be5f3fbae4449bf4552" }
-remanence-format-driver = { git = "https://github.com/archivetechie/remanence", rev = "04d04d28b3a917642c275be5f3fbae4449bf4552" }
-remanence-library = { git = "https://github.com/archivetechie/remanence", rev = "04d04d28b3a917642c275be5f3fbae4449bf4552" }
+remanence-cli = { git = "https://github.com/archivetechie/remanence", rev = "f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84" }
+remanence-daemon = { git = "https://github.com/archivetechie/remanence", rev = "f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84" }
+remanence-format-driver = { git = "https://github.com/archivetechie/remanence", rev = "f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84" }
+remanence-library = { git = "https://github.com/archivetechie/remanence", rev = "f643f8c2bca7f2971b5ed3da4280fb8f4c0b0e84" }
 
 [profile.release]
 lto = "thin"

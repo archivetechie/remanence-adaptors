@@ -16,8 +16,8 @@ discontinued legacy application. It was developed from surviving tapes and
 dump files after the original software was no longer available. The adapter
 can probe, scan, restore, and recover from seekable dumps or physical tape
 records. It does not write BRU archives. Members marked for BRU's built-in or
-external software compression are detected and rejected before any catalog
-entry or payload is emitted; decompression is not implemented yet.
+external software compression are detected and rejected before that member is
+cataloged or restored; decompression is not implemented yet.
 
 The stable catalog format ID is `remanence-bru`; the CLI alias is `bru`.
 

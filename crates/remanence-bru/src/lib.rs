@@ -35,8 +35,8 @@ const MAGIC_ARCHIVE_TERMINATOR: u64 = 0x7890;
 
 const ARTIME_OFFSET: usize = 0x098;
 const BUFSIZE_OFFSET: usize = 0x0A0;
-const RELEASE_MAJOR_OFFSET: usize = 0x0B8;
-const RELEASE_MINOR_OFFSET: usize = 0x0BC;
+const RELEASE_MINOR_OFFSET: usize = 0x0B8;
+const RELEASE_MAJOR_OFFSET: usize = 0x0BC;
 const VARIANT_OFFSET: usize = 0x0C0;
 const ARCHIVE_ID_LOW_OFFSET: usize = 0x0D8;
 const LABEL_OFFSET: usize = 0x1D0;
@@ -774,7 +774,7 @@ fn walk_archive(
         };
         let header = parse_file_header(&block.data)?;
         if header.compression != BruCompression::None {
-            return Err(FormatError::unsupported(format!(
+            return Err(FormatError::unsupported_feature(format!(
                 "BRU member {} uses {:?} software compression",
                 header.path, header.compression
             )));
@@ -803,6 +803,9 @@ fn file_header_or_resync(
     if is_archive_terminator(&block) {
         return Ok(None);
     }
+    if is_suspect_archive_terminator(&block) {
+        return resync_to_file_header(source, visitor);
+    }
     if is_resync_file_header(&block) {
         Ok(Some(block))
     } else {
@@ -830,6 +833,9 @@ fn resync_to_file_header(
         if is_archive_terminator(&block) {
             return Ok(None);
         }
+        if is_suspect_archive_terminator(&block) {
+            continue;
+        }
         if is_resync_file_header(&block) {
             return Ok(Some(block));
         }
@@ -839,10 +845,13 @@ fn resync_to_file_header(
 }
 
 fn is_archive_terminator(block: &BruBlock) -> bool {
-    matches!(
-        block.status,
-        BruBlockStatus::Ok | BruBlockStatus::ReadErrorData
-    ) && read_magic(&block.data).ok() == Some(MAGIC_ARCHIVE_TERMINATOR)
+    block.status == BruBlockStatus::Ok
+        && read_magic(&block.data).ok() == Some(MAGIC_ARCHIVE_TERMINATOR)
+}
+
+fn is_suspect_archive_terminator(block: &BruBlock) -> bool {
+    block.status == BruBlockStatus::ReadErrorData
+        && read_magic(&block.data).ok() == Some(MAGIC_ARCHIVE_TERMINATOR)
 }
 
 fn is_resync_file_header(block: &BruBlock) -> bool {
@@ -1350,8 +1359,8 @@ mod tests {
         assert_eq!(header.archive_id, "4de47d2661a8");
         assert_eq!(header.label, "TEST");
         assert_eq!(header.buffer_size_bytes, 1024 * 1024);
-        assert_eq!(header.release_major, 17);
-        assert_eq!(header.release_minor, 1);
+        assert_eq!(header.release_major, 1);
+        assert_eq!(header.release_minor, 17);
     }
 
     #[test]
@@ -1397,12 +1406,14 @@ mod tests {
             let mut scan_reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump.clone()));
             let mut catalog = CatalogSink::default();
             let scan_error = scan_reader.scan(&mut catalog).unwrap_err();
+            assert!(matches!(scan_error, FormatError::UnsupportedFeature(_)));
             assert!(scan_error.to_string().contains(expected));
             assert!(catalog.entries.is_empty());
 
             let mut stream_reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump));
             let mut events = EventSink::default();
             let stream_error = stream_reader.stream_all(&mut events).unwrap_err();
+            assert!(matches!(stream_error, FormatError::UnsupportedFeature(_)));
             assert!(stream_error.to_string().contains(expected));
             assert!(events.entries.is_empty());
             assert!(events.data.is_empty());
@@ -1426,6 +1437,37 @@ mod tests {
         assert_eq!(report.bytes, 3);
         assert_eq!(report.archive_gaps, 0);
         assert_eq!(sink.data, b"abc");
+    }
+
+    #[test]
+    fn suspect_archive_terminator_preserves_the_physical_read_error() {
+        let records = vec![
+            archive_block().to_vec(),
+            file_header_block(1, "file.bin", 3, b"abc").to_vec(),
+        ];
+        let mut source = AdvancingReadErrorSource {
+            inner: FakePhysicalSource::new(records),
+            fail_at: 2,
+            failed: false,
+            transferred: archive_terminator_block().to_vec(),
+        };
+        let mut sink = EventSink::default();
+        let probe = ProbeResult {
+            format_id: BruFormat.id().to_string(),
+            confidence: ProbeConfidence::Certain,
+            source_requirement: SourceRequirement::PhysicalTapeRecords,
+            adapter_state: Vec::new(),
+        };
+
+        let report = {
+            let mut reader = BruFormat.open_tape_reader(&mut source, &probe).unwrap();
+            reader.stream_all(&mut sink).unwrap()
+        };
+
+        assert_eq!(report.entries, 1);
+        assert_eq!(report.bytes, 3);
+        assert_eq!(report.archive_gaps, 1);
+        assert_eq!(sink.archive_gaps[0].cause, ArchiveGapCause::ReadError);
     }
 
     #[test]
@@ -1562,6 +1604,12 @@ mod tests {
     #[test]
     fn vendor_validated_fixture_covers_utf8_long_paths_and_continuations() {
         let fixture = include_bytes!("../../../fixtures/reference-edge.bru");
+        let mut header_reader =
+            BruFormat.open_dump_reader(std::io::Cursor::new(fixture.as_slice()));
+        let header = header_reader.read_archive_header().unwrap();
+        assert_eq!(header.release_major, 1);
+        assert_eq!(header.release_minor, 17);
+
         let mut reader = BruFormat.open_dump_reader(std::io::Cursor::new(fixture.as_slice()));
         let mut sink = EventSink::default();
 
@@ -2118,8 +2166,8 @@ mod tests {
         put_hex(&mut block, MAGIC_OFFSET, MAGIC_SIZE, MAGIC_ARCHIVE_HEADER);
         put_hex(&mut block, ARTIME_OFFSET, 8, 0x4DE47D26);
         put_hex(&mut block, BUFSIZE_OFFSET, 8, 1024 * 1024);
-        put_hex(&mut block, RELEASE_MAJOR_OFFSET, 4, 17);
-        put_hex(&mut block, RELEASE_MINOR_OFFSET, 4, 1);
+        put_hex(&mut block, RELEASE_MAJOR_OFFSET, 4, 1);
+        put_hex(&mut block, RELEASE_MINOR_OFFSET, 4, 17);
         put_hex(&mut block, VARIANT_OFFSET, 4, 0);
         put_hex(&mut block, ARCHIVE_ID_LOW_OFFSET, 4, 0x61A8);
         put_ascii(&mut block, LABEL_OFFSET, "TEST");

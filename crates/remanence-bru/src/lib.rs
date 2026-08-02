@@ -14,7 +14,9 @@ use remanence_format_driver::{
     FormatCapabilities, FormatDescriptor, FormatError, NormalizedEntry, ProbeConfidence,
     ProbeResult, ReadSeek, ScanIntegrityBasis, ScanReport, SourceRequirement, StreamReport,
 };
-use remanence_library::{BlockSize, PhysicalReadOutcome, PhysicalTapeSource};
+use remanence_library::{
+    BlockSize, PhysicalReadOutcome, PhysicalTapePosition, PhysicalTapeSource, TapeIoError,
+};
 
 /// BRU logical block size in bytes.
 pub const BRU_BLOCK_SIZE: usize = 2048;
@@ -398,6 +400,7 @@ struct PhysicalBruBlockSource<'a> {
     record_pos: usize,
     record_len: usize,
     logical_offset: u64,
+    physical_position: Option<PhysicalTapePosition>,
 }
 
 impl<'a> PhysicalBruBlockSource<'a> {
@@ -408,6 +411,7 @@ impl<'a> PhysicalBruBlockSource<'a> {
             record_pos: 0,
             record_len: 0,
             logical_offset: 0,
+            physical_position: None,
         }
     }
 }
@@ -435,17 +439,64 @@ impl BruBlockSource for PhysicalBruBlockSource<'_> {
                 )));
             }
 
-            match self.source.read_record(&mut self.record)? {
-                PhysicalReadOutcome::Data { bytes: 0, .. } => {
+            let position_before = match self.physical_position {
+                Some(position) => position,
+                None => {
+                    let position = self.source.position()?;
+                    self.physical_position = Some(position);
+                    position
+                }
+            };
+            match self.source.read_record(&mut self.record) {
+                Err(error) => {
+                    if !recoverable_advancing_read_error(&error) {
+                        return Err(error.into());
+                    }
+                    let Ok(position_after) = self.source.position() else {
+                        return Err(error.into());
+                    };
+                    if position_after.partition != position_before.partition
+                        || position_after.lba <= position_before.lba
+                    {
+                        return Err(error.into());
+                    }
+                    self.physical_position = Some(position_after);
+                    let offset = self.logical_offset;
+                    self.logical_offset = self
+                        .logical_offset
+                        .checked_add(BRU_BLOCK_SIZE as u64)
+                        .ok_or_else(|| {
+                            FormatError::Parse("BRU logical offset overflow".to_string())
+                        })?;
+                    return Ok(Some(BruBlock::read_error(
+                        offset,
+                        position_before,
+                        position_after,
+                        &error.to_string(),
+                    )));
+                }
+                Ok(PhysicalReadOutcome::Data { bytes: 0, .. }) => {
                     return Err(FormatError::Parse(
                         "BRU physical data record is empty".to_string(),
                     ));
                 }
-                PhysicalReadOutcome::Data { bytes, .. } => {
+                Ok(PhysicalReadOutcome::Data {
+                    bytes,
+                    position_after,
+                }) => {
+                    if bytes > self.record.len() {
+                        return Err(FormatError::Parse(format!(
+                            "physical source returned {bytes} bytes for a {}-byte BRU buffer",
+                            self.record.len()
+                        )));
+                    }
+                    self.physical_position = Some(position_after);
                     self.record_pos = 0;
                     self.record_len = bytes;
                 }
-                PhysicalReadOutcome::Filemark { .. } | PhysicalReadOutcome::EndOfData { .. } => {
+                Ok(PhysicalReadOutcome::Filemark { position_after })
+                | Ok(PhysicalReadOutcome::EndOfData { position_after }) => {
+                    self.physical_position = Some(position_after);
                     return Ok(None);
                 }
             }
@@ -453,11 +504,19 @@ impl BruBlockSource for PhysicalBruBlockSource<'_> {
     }
 }
 
+fn recoverable_advancing_read_error(error: &TapeIoError) -> bool {
+    matches!(
+        error,
+        TapeIoError::CheckCondition(_) | TapeIoError::ReadBufferTooSmall { .. }
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BruBlockStatus {
     Ok,
     ChecksumFailed,
     Partial,
+    ReadError,
 }
 
 #[derive(Debug)]
@@ -466,6 +525,7 @@ struct BruBlock {
     data: [u8; BRU_BLOCK_SIZE],
     valid_len: usize,
     status: BruBlockStatus,
+    source_state: Vec<u8>,
 }
 
 impl BruBlock {
@@ -480,6 +540,7 @@ impl BruBlock {
             data,
             valid_len: BRU_BLOCK_SIZE,
             status,
+            source_state: Vec::new(),
         }
     }
 
@@ -489,6 +550,28 @@ impl BruBlock {
             data,
             valid_len,
             status: BruBlockStatus::Partial,
+            source_state: Vec::new(),
+        }
+    }
+
+    fn read_error(
+        offset: u64,
+        position_before: PhysicalTapePosition,
+        position_after: PhysicalTapePosition,
+        diagnostic: &str,
+    ) -> Self {
+        let mut source_state = Vec::with_capacity(32 + diagnostic.len());
+        source_state.extend_from_slice(&position_before.partition.to_le_bytes());
+        source_state.extend_from_slice(&position_before.lba.to_le_bytes());
+        source_state.extend_from_slice(&position_after.partition.to_le_bytes());
+        source_state.extend_from_slice(&position_after.lba.to_le_bytes());
+        source_state.extend_from_slice(diagnostic.as_bytes());
+        Self {
+            offset,
+            data: [0; BRU_BLOCK_SIZE],
+            valid_len: BRU_BLOCK_SIZE,
+            status: BruBlockStatus::ReadError,
+            source_state,
         }
     }
 }
@@ -607,6 +690,10 @@ fn file_header_or_resync(
         visitor.archive_gap(&archive_gap_range(&block, ArchiveGapCause::Missing))?;
         return Ok(None);
     }
+    if block.status == BruBlockStatus::ReadError {
+        visitor.archive_gap(&archive_gap_range(&block, ArchiveGapCause::ReadError))?;
+        return resync_to_file_header(source, visitor);
+    }
     if is_resync_file_header(&block) {
         Ok(Some(block))
     } else {
@@ -626,6 +713,10 @@ fn resync_to_file_header(
         if block.status == BruBlockStatus::Partial {
             visitor.archive_gap(&archive_gap_range(&block, ArchiveGapCause::Missing))?;
             return Ok(None);
+        }
+        if block.status == BruBlockStatus::ReadError {
+            visitor.archive_gap(&archive_gap_range(&block, ArchiveGapCause::ReadError))?;
+            continue;
         }
         if is_resync_file_header(&block) {
             return Ok(Some(block));
@@ -697,14 +788,17 @@ fn stream_entry_body(
             Err(err) => return Err(err),
         };
         if block.status == BruBlockStatus::Partial {
+            return stream_partial_continuation(visitor, entry, header, position, block);
+        }
+        if block.status == BruBlockStatus::ReadError {
             visitor.damage(&damage_range(
                 &entry.file_id,
                 position,
                 header.size_bytes,
-                DamageStatus::Missing,
+                DamageStatus::ReadError,
                 Some(block.offset),
             ))?;
-            visitor.archive_gap(&archive_gap_range(&block, ArchiveGapCause::Missing))?;
+            visitor.archive_gap(&archive_gap_range(&block, ArchiveGapCause::ReadError))?;
             return Ok(None);
         }
         let magic = match read_magic(&block.data) {
@@ -752,6 +846,71 @@ fn stream_entry_body(
         visitor.data(position, &block.data[CONTINUATION_DATA_OFFSET..end])?;
         position += dlen;
     }
+    Ok(None)
+}
+
+fn stream_partial_continuation(
+    visitor: &mut dyn BruVisitor,
+    entry: &NormalizedEntry,
+    header: &BruFileHeader,
+    mut position: u64,
+    block: BruBlock,
+) -> Result<Option<BruBlock>, FormatError> {
+    let continuation_header_end = CONTINUATION_DLEN_OFFSET + 4;
+    if block.valid_len < continuation_header_end
+        || read_magic(&block.data).ok() != Some(MAGIC_CONTINUATION)
+    {
+        visitor.damage(&damage_range(
+            &entry.file_id,
+            position,
+            header.size_bytes,
+            DamageStatus::Missing,
+            Some(block.offset),
+        ))?;
+        visitor.archive_gap(&archive_gap_range(&block, ArchiveGapCause::Missing))?;
+        return Ok(None);
+    }
+
+    let dlen = read_hex_u64(&block.data, CONTINUATION_DLEN_OFFSET, 4)?;
+    let remaining = header.size_bytes - position;
+    if dlen == 0 || dlen > 1792 || dlen > remaining {
+        return abort_entry_body_after_bad_continuation(visitor, entry, header, position, block);
+    }
+
+    let available = block
+        .valid_len
+        .saturating_sub(CONTINUATION_DATA_OFFSET)
+        .min(dlen as usize);
+    if available > 0 {
+        let available_end = position + available as u64;
+        visitor.damage(&damage_range(
+            &entry.file_id,
+            position,
+            available_end,
+            DamageStatus::ChecksumFailed,
+            Some(block.offset),
+        ))?;
+        visitor.data(
+            position,
+            &block.data[CONTINUATION_DATA_OFFSET..CONTINUATION_DATA_OFFSET + available],
+        )?;
+        position = available_end;
+    }
+    if position < header.size_bytes {
+        visitor.damage(&damage_range(
+            &entry.file_id,
+            position,
+            header.size_bytes,
+            DamageStatus::Missing,
+            Some(block.offset + block.valid_len as u64),
+        ))?;
+    }
+    visitor.archive_gap(&ArchiveGapRange {
+        source_start: block.offset + block.valid_len as u64,
+        source_end: block.offset + BRU_BLOCK_SIZE as u64,
+        cause: ArchiveGapCause::Missing,
+        adapter_state: block.source_state.clone(),
+    })?;
     Ok(None)
 }
 
@@ -815,10 +974,13 @@ fn damage_range(
 }
 
 fn archive_gap_range(block: &BruBlock, cause: ArchiveGapCause) -> ArchiveGapRange {
-    let mut adapter_state = Vec::with_capacity(16);
-    adapter_state.extend_from_slice(&block.offset.to_le_bytes());
-    if let Ok(magic) = read_magic(&block.data) {
-        adapter_state.extend_from_slice(&magic.to_le_bytes());
+    let mut adapter_state = block.source_state.clone();
+    if adapter_state.is_empty() {
+        adapter_state.reserve(16);
+        adapter_state.extend_from_slice(&block.offset.to_le_bytes());
+        if let Ok(magic) = read_magic(&block.data) {
+            adapter_state.extend_from_slice(&magic.to_le_bytes());
+        }
     }
     ArchiveGapRange {
         source_start: block.offset,
@@ -962,7 +1124,7 @@ fn io_to_format(context: impl Into<String>, source: io::Error) -> FormatError {
 mod tests {
     use super::*;
 
-    use remanence_library::{PhysicalFilemarkSpace, PhysicalTapePosition, TapeIoError};
+    use remanence_library::{PhysicalFilemarkSpace, ScsiError};
 
     #[derive(Default)]
     struct CatalogSink {
@@ -1092,6 +1254,62 @@ mod tests {
         assert_eq!(sink.damages[0].end, 5);
         assert_eq!(sink.damages[0].status, DamageStatus::Missing);
         assert_eq!(sink.ended, vec![FileId("bru:1".to_string())]);
+    }
+
+    #[test]
+    fn streams_complete_payload_from_a_partial_continuation_as_suspect() {
+        let continuation = continuation_block(b"cde");
+        let mut dump = [
+            archive_block().as_slice(),
+            file_header_block(1, "file.bin", 5, b"ab").as_slice(),
+        ]
+        .concat();
+        dump.extend_from_slice(&continuation[..CONTINUATION_DATA_OFFSET + 3]);
+        let mut reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump));
+        let mut sink = EventSink::default();
+
+        let report = reader.stream_all(&mut sink).unwrap();
+
+        assert_eq!(report.entries, 1);
+        assert_eq!(report.bytes, 5);
+        assert_eq!(report.damage_events, 1);
+        assert_eq!(report.archive_gaps, 1);
+        assert_eq!(sink.data, b"abcde");
+        assert_eq!(sink.data_ranges, vec![(0, 2), (2, 5)]);
+        assert_eq!(sink.damages[0].start, 2);
+        assert_eq!(sink.damages[0].end, 5);
+        assert_eq!(sink.damages[0].status, DamageStatus::ChecksumFailed);
+        assert_eq!(
+            sink.archive_gaps[0].source_start,
+            2 * BRU_BLOCK_SIZE as u64 + CONTINUATION_DATA_OFFSET as u64 + 3
+        );
+        assert_eq!(sink.archive_gaps[0].source_end, 3 * BRU_BLOCK_SIZE as u64);
+        assert_eq!(sink.archive_gaps[0].cause, ArchiveGapCause::Missing);
+    }
+
+    #[test]
+    fn partial_continuation_marks_only_unavailable_file_bytes_missing() {
+        let continuation = continuation_block(b"cde");
+        let mut dump = [
+            archive_block().as_slice(),
+            file_header_block(1, "file.bin", 5, b"ab").as_slice(),
+        ]
+        .concat();
+        dump.extend_from_slice(&continuation[..CONTINUATION_DATA_OFFSET + 1]);
+        let mut reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump));
+        let mut sink = EventSink::default();
+
+        let report = reader.stream_all(&mut sink).unwrap();
+
+        assert_eq!(report.bytes, 3);
+        assert_eq!(report.damage_events, 2);
+        assert_eq!(sink.data, b"abc");
+        assert_eq!(sink.damages[0].start, 2);
+        assert_eq!(sink.damages[0].end, 3);
+        assert_eq!(sink.damages[0].status, DamageStatus::ChecksumFailed);
+        assert_eq!(sink.damages[1].start, 3);
+        assert_eq!(sink.damages[1].end, 5);
+        assert_eq!(sink.damages[1].status, DamageStatus::Missing);
     }
 
     #[test]
@@ -1344,6 +1562,44 @@ mod tests {
         assert_eq!(sink.data, b"abc");
     }
 
+    #[test]
+    fn physical_reader_reports_an_advancing_read_error_and_resynchronizes() {
+        let records = vec![
+            archive_block().to_vec(),
+            file_header_block(1, "first.bin", 5, b"ab").to_vec(),
+            vec![0; BRU_BLOCK_SIZE],
+            file_header_block(2, "second.bin", 3, b"two").to_vec(),
+        ];
+        let mut source = AdvancingReadErrorSource {
+            inner: FakePhysicalSource::new(records),
+            fail_at: 2,
+            failed: false,
+        };
+        let mut sink = EventSink::default();
+        let probe = ProbeResult {
+            format_id: BruFormat.id().to_string(),
+            confidence: ProbeConfidence::Certain,
+            source_requirement: SourceRequirement::PhysicalTapeRecords,
+            adapter_state: Vec::new(),
+        };
+
+        let report = {
+            let mut reader = BruFormat.open_tape_reader(&mut source, &probe).unwrap();
+            reader.stream_all(&mut sink).unwrap()
+        };
+
+        assert_eq!(report.entries, 2);
+        assert_eq!(report.bytes, 5);
+        assert_eq!(report.damage_events, 1);
+        assert_eq!(report.archive_gaps, 1);
+        assert_eq!(sink.data, b"abtwo");
+        assert_eq!(sink.damages[0].start, 2);
+        assert_eq!(sink.damages[0].end, 5);
+        assert_eq!(sink.damages[0].status, DamageStatus::ReadError);
+        assert_eq!(sink.archive_gaps[0].cause, ArchiveGapCause::ReadError);
+        assert_eq!(sink.entries[1].path, "second.bin");
+    }
+
     struct FakePhysicalSource {
         records: Vec<Vec<u8>>,
         next_record: usize,
@@ -1427,6 +1683,46 @@ mod tests {
 
         fn position(&mut self) -> Result<PhysicalTapePosition, TapeIoError> {
             Ok(self.position)
+        }
+    }
+
+    struct AdvancingReadErrorSource {
+        inner: FakePhysicalSource,
+        fail_at: usize,
+        failed: bool,
+    }
+
+    impl PhysicalTapeSource for AdvancingReadErrorSource {
+        fn configure_block_size(&mut self, block_size: BlockSize) -> Result<(), TapeIoError> {
+            self.inner.configure_block_size(block_size)
+        }
+
+        fn locate_physical(
+            &mut self,
+            position: PhysicalTapePosition,
+        ) -> Result<PhysicalTapePosition, TapeIoError> {
+            self.inner.locate_physical(position)
+        }
+
+        fn space_filemarks(&mut self, count: i64) -> Result<PhysicalFilemarkSpace, TapeIoError> {
+            self.inner.space_filemarks(count)
+        }
+
+        fn read_record(&mut self, buf: &mut [u8]) -> Result<PhysicalReadOutcome, TapeIoError> {
+            if !self.failed && self.inner.next_record == self.fail_at {
+                self.failed = true;
+                self.inner.next_record += 1;
+                self.inner.position = PhysicalTapePosition::new(self.inner.next_record as u64);
+                return Err(TapeIoError::CheckCondition(ScsiError::CheckCondition {
+                    sense: vec![0x70, 0, 0x03, 0, 0, 0, 0, 0x0a],
+                    bytes_transferred: 0,
+                }));
+            }
+            self.inner.read_record(buf)
+        }
+
+        fn position(&mut self) -> Result<PhysicalTapePosition, TapeIoError> {
+            self.inner.position()
         }
     }
 

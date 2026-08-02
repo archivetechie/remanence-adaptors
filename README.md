@@ -21,7 +21,7 @@ The stable catalog format ID is `remanence-bru`; the CLI alias is `bru`.
 
 ## Build
 
-Rust 1.88+ on Linux:
+Rust 1.88+ and the Protocol Buffers compiler (`protoc`) on Linux:
 
 ```sh
 cargo build --release

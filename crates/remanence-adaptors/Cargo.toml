@@ -32,4 +32,5 @@ missing_docs = "warn"
 
 [dev-dependencies]
 base64 = "0.22"
+serde_json = "1"
 tempfile = "3"

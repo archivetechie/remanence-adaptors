@@ -1904,6 +1904,7 @@ dependencies = [
  "remanence-cli",
  "remanence-daemon",
  "remanence-format-driver",
+ "serde_json",
  "tempfile",
 ]
 

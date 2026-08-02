@@ -1,0 +1,17 @@
+[package]
+name = "remanence-bru"
+description = "Auxiliary read-only BRU/BRU-PE format adapter for Remanence."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+remanence-format-driver.workspace = true
+remanence-library.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

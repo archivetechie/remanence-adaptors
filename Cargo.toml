@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/remanence-adaptors",
+    "crates/remanence-bru",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Archive Technology <admin@archivetech.org>"]
+license = "Apache-2.0"
+repository = "https://github.com/archivetechie/remanence-adaptors"
+
+[workspace.dependencies]
+remanence-cli = { git = "https://github.com/archivetechie/remanence", rev = "04d04d28b3a917642c275be5f3fbae4449bf4552" }
+remanence-daemon = { git = "https://github.com/archivetechie/remanence", rev = "04d04d28b3a917642c275be5f3fbae4449bf4552" }
+remanence-format-driver = { git = "https://github.com/archivetechie/remanence", rev = "04d04d28b3a917642c275be5f3fbae4449bf4552" }
+remanence-library = { git = "https://github.com/archivetechie/remanence", rev = "04d04d28b3a917642c275be5f3fbae4449bf4552" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

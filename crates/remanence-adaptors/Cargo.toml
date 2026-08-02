@@ -1,0 +1,35 @@
+[package]
+name = "remanence-adaptors"
+description = "Remanence binaries assembled with selected auxiliary foreign-format adapters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+remanence-bru = { path = "../remanence-bru" }
+remanence-cli.workspace = true
+remanence-daemon.workspace = true
+remanence-format-driver.workspace = true
+
+[[bin]]
+name = "rem"
+path = "src/bin/rem.rs"
+
+[[bin]]
+name = "rem-debug"
+path = "src/bin/rem-debug.rs"
+
+[[bin]]
+name = "rem-daemon"
+path = "src/bin/rem-daemon.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[dev-dependencies]
+base64 = "0.22"
+tempfile = "3"

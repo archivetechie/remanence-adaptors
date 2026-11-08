@@ -47,6 +47,10 @@ const FILE_PATH_SIZE: usize = 128;
 const FILE_SEQUENCE_OFFSET: usize = 0x0C4;
 const INLINE_DATA_LEN_OFFSET: usize = 0x0DC;
 const INLINE_DATA_OFFSET: usize = 0x400;
+const INLINE_DATA_AREA_SIZE: usize = BRU_BLOCK_SIZE - INLINE_DATA_OFFSET;
+/// Name-field prefix of the stand-in BRU writes when a member's real path does
+/// not fit the name field; the real path then opens the inline data area.
+const LONG_PATH_STAND_IN_PREFIX: &[u8] = b"brutmp/";
 const ST_MODE_OFFSET: usize = 0x180;
 const ST_SIZE_OFFSET: usize = 0x1B8;
 const FILE_FLAGS_OFFSET: usize = 0x1D8;
@@ -874,8 +878,9 @@ fn stream_entry_body(
     }
 
     let mut position = 0u64;
+    let inline_offset = file_header_layout(&header_block.data)?.inline_data_offset;
     let inline_len = read_hex_u64(&header_block.data, INLINE_DATA_LEN_OFFSET, 4)?;
-    if inline_len > 1024 {
+    if inline_len > (BRU_BLOCK_SIZE - inline_offset) as u64 {
         return Err(FormatError::Parse(format!(
             "invalid BRU inline_data_len={inline_len} at byte offset 0x{:x}",
             header_block.offset
@@ -888,7 +893,7 @@ fn stream_entry_body(
         )));
     }
     if inline_len > 0 {
-        let end = INLINE_DATA_OFFSET + inline_len as usize;
+        let end = inline_offset + inline_len as usize;
         if let Some(status) = payload_damage_status(header_block.status) {
             visitor.damage(&damage_range(
                 &entry.file_id,
@@ -898,7 +903,7 @@ fn stream_entry_body(
                 Some(header_block.offset),
             ))?;
         }
-        visitor.data(position, &header_block.data[INLINE_DATA_OFFSET..end])?;
+        visitor.data(position, &header_block.data[inline_offset..end])?;
         position += inline_len;
     }
 
@@ -1203,7 +1208,9 @@ fn parse_file_header(block: &[u8; BRU_BLOCK_SIZE]) -> Result<BruFileHeader, Form
             "not a BRU file header: magic=0x{magic:04x}"
         )));
     }
-    let (path, raw_path) = read_ascii(block, FILE_PATH_OFFSET, FILE_PATH_SIZE);
+    let layout = file_header_layout(block)?;
+    let raw_path = layout.raw_path;
+    let path = String::from_utf8_lossy(&raw_path).into_owned();
     let mode = read_hex_u64(block, ST_MODE_OFFSET, 8)?;
     let kind = match mode & S_IFMT {
         S_IFDIR => EntryKind::Directory,
@@ -1228,6 +1235,69 @@ fn parse_file_header(block: &[u8; BRU_BLOCK_SIZE]) -> Result<BruFileHeader, Form
         mode,
         compression,
     })
+}
+
+/// Where a file header's path and inline data live.
+struct FileHeaderLayout {
+    /// Member path bytes, without the terminating NUL.
+    raw_path: Vec<u8>,
+    /// Block offset at which the member's inline data begins.
+    inline_data_offset: usize,
+}
+
+/// Compute a file header's path and inline-data offset.
+///
+/// A header whose name field begins with `brutmp/` holds a stand-in name; the
+/// real path is the NUL-terminated string that opens the inline data area, and
+/// the member's inline data follows that NUL. Every other header keeps its
+/// path in the name field and its inline data at `0x400`.
+fn file_header_layout(block: &[u8; BRU_BLOCK_SIZE]) -> Result<FileHeaderLayout, FormatError> {
+    let (_, name) = read_ascii(block, FILE_PATH_OFFSET, FILE_PATH_SIZE);
+    if !name.starts_with(LONG_PATH_STAND_IN_PREFIX) {
+        return Ok(FileHeaderLayout {
+            raw_path: name,
+            inline_data_offset: INLINE_DATA_OFFSET,
+        });
+    }
+    if final_path_component(&name).is_empty() {
+        return Err(FormatError::Parse(format!(
+            "BRU long-path header: stand-in {:?} has an empty final component",
+            String::from_utf8_lossy(&name)
+        )));
+    }
+    let area = &block[INLINE_DATA_OFFSET..INLINE_DATA_OFFSET + INLINE_DATA_AREA_SIZE];
+    let nul = area.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        FormatError::Parse(
+            "BRU long-path header: no NUL terminates the real path in the inline data area"
+                .to_string(),
+        )
+    })?;
+    let real_path = &area[..nul];
+    // An empty real path has an empty final component, so the comparison with
+    // the stand-in's non-empty final component refuses it.
+    if final_path_component(real_path) != final_path_component(&name) {
+        return Err(FormatError::Parse(format!(
+            "BRU long-path header: real path {:?} and stand-in {:?} differ in their final component",
+            String::from_utf8_lossy(real_path),
+            String::from_utf8_lossy(&name)
+        )));
+    }
+    let path_area_len = nul + 1;
+    let inline_len = read_hex_u64(block, INLINE_DATA_LEN_OFFSET, 4)?;
+    let capacity = INLINE_DATA_AREA_SIZE - path_area_len;
+    if inline_len > capacity as u64 {
+        return Err(FormatError::Parse(format!(
+            "BRU long-path header: inline_data_len={inline_len} exceeds the {capacity} bytes after the real path"
+        )));
+    }
+    Ok(FileHeaderLayout {
+        raw_path: real_path.to_vec(),
+        inline_data_offset: INLINE_DATA_OFFSET + path_area_len,
+    })
+}
+
+fn final_path_component(path: &[u8]) -> &[u8] {
+    path.rsplit(|byte| *byte == b'/').next().unwrap_or(path)
 }
 
 fn read_magic(block: &[u8; BRU_BLOCK_SIZE]) -> Result<u64, FormatError> {
@@ -2145,6 +2215,252 @@ mod tests {
         fn position(&mut self) -> Result<PhysicalTapePosition, TapeIoError> {
             self.inner.position()
         }
+    }
+
+    const LONG_REAL_PATH: &str = "survey-collection/1998-river-survey/camera-originals/reel-017/transfer-pass-2/interviews/site-visit-north-bank-take-000003-wide.avi";
+    const LONG_STAND_IN: &str = "brutmp/1998-river-survey/camera-originals/reel-017/transfer-pass-2/interviews/site-visit-north-bank-take-000003-wide.avi";
+    const LONG_INLINE_LEN: usize = 892;
+    const LONG_SIZE: usize = LONG_INLINE_LEN + 1792 + 500;
+
+    #[test]
+    fn long_path_member_is_catalogued_under_its_real_path() {
+        assert_eq!(LONG_REAL_PATH.len(), 131);
+        let dump = [archive_block().to_vec(), long_path_member(7)].concat();
+        let mut reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump));
+        let mut sink = CatalogSink::default();
+
+        let report = reader.scan(&mut sink).unwrap();
+
+        assert_eq!(report.entries, 1);
+        assert_eq!(report.archive_gaps, 0);
+        assert_eq!(sink.entries.len(), 1);
+        assert_eq!(sink.entries[0].path, LONG_REAL_PATH);
+        assert_eq!(sink.entries[0].file_id, FileId("bru:7".to_string()));
+        assert_eq!(sink.entries[0].kind, EntryKind::RegularFile);
+        assert_eq!(sink.entries[0].size_bytes, Some(LONG_SIZE as u64));
+        assert!(sink.entries[0]
+            .adapter_state
+            .ends_with(LONG_REAL_PATH.as_bytes()));
+    }
+
+    #[test]
+    fn long_path_member_streams_its_exact_payload() {
+        let dump = [archive_block().to_vec(), long_path_member(7)].concat();
+        let mut reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump));
+        let mut sink = EventSink::default();
+
+        let report = reader.stream_all(&mut sink).unwrap();
+
+        let payload = long_path_payload(LONG_SIZE);
+        assert_eq!(report.entries, 1);
+        assert_eq!(report.bytes, LONG_SIZE as u64);
+        assert_eq!(report.damage_events, 0);
+        assert_eq!(report.archive_gaps, 0);
+        assert_eq!(sink.entries[0].path, LONG_REAL_PATH);
+        assert_eq!(sink.data.len(), LONG_SIZE);
+        assert_eq!(sink.data[0], payload[0]);
+        assert_eq!(
+            sink.data[LONG_INLINE_LEN - 1..=LONG_INLINE_LEN],
+            payload[LONG_INLINE_LEN - 1..=LONG_INLINE_LEN]
+        );
+        assert_eq!(sink.data[LONG_SIZE - 1], payload[LONG_SIZE - 1]);
+        assert_eq!(sink.data, payload);
+        assert_eq!(
+            sink.data_ranges,
+            vec![
+                (0, LONG_INLINE_LEN as u64),
+                (LONG_INLINE_LEN as u64, (LONG_INLINE_LEN + 1792) as u64),
+                ((LONG_INLINE_LEN + 1792) as u64, LONG_SIZE as u64),
+            ]
+        );
+        assert_eq!(sink.ended, vec![FileId("bru:7".to_string())]);
+    }
+
+    #[test]
+    fn mixed_archive_restores_normal_and_long_path_members_exactly() {
+        let dump = [
+            archive_block().to_vec(),
+            file_header_block(1, "before.bin", 3, b"one").to_vec(),
+            long_path_member(2),
+            file_header_block(3, "after.bin", 3, b"two").to_vec(),
+        ]
+        .concat();
+        let mut reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump));
+        let mut sink = EventSink::default();
+
+        let report = reader.stream_all(&mut sink).unwrap();
+
+        assert_eq!(report.entries, 3);
+        assert_eq!(report.bytes, (LONG_SIZE + 6) as u64);
+        assert_eq!(report.damage_events, 0);
+        assert_eq!(report.archive_gaps, 0);
+        let paths: Vec<&str> = sink.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["before.bin", LONG_REAL_PATH, "after.bin"]);
+        let expected = [
+            b"one".to_vec(),
+            long_path_payload(LONG_SIZE),
+            b"two".to_vec(),
+        ]
+        .concat();
+        assert_eq!(sink.data, expected);
+    }
+
+    #[test]
+    fn refused_long_path_headers_become_gaps_and_later_members_restore() {
+        let payload = long_path_payload(LONG_SIZE);
+
+        // No NUL in 0x400..0x800: a path-shaped run fills the whole area.
+        let tail = "/site-visit-north-bank-take-000003-wide.avi";
+        let mut no_nul = vec![b'x'; INLINE_DATA_AREA_SIZE - 1 - tail.len()];
+        no_nul.extend_from_slice(tail.as_bytes());
+        no_nul.push(b'x');
+        assert_eq!(no_nul.len(), INLINE_DATA_AREA_SIZE);
+
+        // Final components differ.
+        let mismatch_path = LONG_REAL_PATH.replace("take-000003", "take-000004");
+        let mut mismatch = mismatch_path.into_bytes();
+        mismatch.push(0);
+        mismatch.extend_from_slice(&payload[..LONG_INLINE_LEN]);
+
+        // inline_data_len one byte larger than the space after the path.
+        let mut too_long = LONG_REAL_PATH.as_bytes().to_vec();
+        too_long.push(0);
+        too_long.extend_from_slice(&payload[..LONG_INLINE_LEN]);
+
+        let cases: [(&str, &str, Vec<u8>, usize); 6] = [
+            ("no NUL", LONG_STAND_IN, no_nul, 0),
+            ("final component", LONG_STAND_IN, mismatch, LONG_INLINE_LEN),
+            (
+                "inline length",
+                LONG_STAND_IN,
+                too_long,
+                LONG_INLINE_LEN + 1,
+            ),
+            (
+                "bare prefix stand-in",
+                "brutmp/",
+                b"survey-collection/\0".to_vec(),
+                0,
+            ),
+            (
+                "stand-in ends in /",
+                "brutmp/interviews/",
+                b"survey-collection/interviews/\0".to_vec(),
+                0,
+            ),
+            ("empty real path", LONG_STAND_IN, vec![0], 0),
+        ];
+        for (label, stand_in, area, inline_len) in cases {
+            let header = long_path_header_block(9, stand_in, &area, inline_len, LONG_SIZE);
+            let dump = [
+                archive_block().as_slice(),
+                header.as_slice(),
+                continuation_block(&payload[..1792]).as_slice(),
+                file_header_block(10, "after.bin", 4, b"tail").as_slice(),
+            ]
+            .concat();
+
+            let mut scan_reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump.clone()));
+            let mut catalog = CatalogSink::default();
+            let scan = scan_reader.scan(&mut catalog).unwrap();
+            assert_eq!(scan.entries, 1, "{label}");
+            assert_eq!(catalog.entries.len(), 1, "{label}");
+            assert_eq!(catalog.entries[0].path, "after.bin", "{label}");
+            assert_refused_header_gap(&catalog.archive_gaps, label);
+
+            let mut stream_reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump));
+            let mut events = EventSink::default();
+            let stream = stream_reader.stream_all(&mut events).unwrap();
+            assert_eq!(stream.entries, 1, "{label}");
+            assert_eq!(stream.bytes, 4, "{label}");
+            assert_eq!(events.entries.len(), 1, "{label}");
+            assert_eq!(events.entries[0].path, "after.bin", "{label}");
+            assert_eq!(events.entries[0].file_id, FileId("bru:10".to_string()));
+            assert_eq!(events.data, b"tail", "{label}");
+            assert_eq!(events.ended, vec![FileId("bru:10".to_string())]);
+            assert!(events.damages.is_empty(), "{label}");
+            assert_refused_header_gap(&events.archive_gaps, label);
+        }
+    }
+
+    #[test]
+    fn normal_header_with_path_like_inline_data_is_read_as_before() {
+        for name in [
+            "media/clip.avi",
+            "media/brutmp/clip.avi",
+            "brutmp",
+            "brutmpx/clip.avi",
+        ] {
+            let final_component = name.rsplit('/').next().unwrap();
+            let mut inline =
+                format!("survey-collection/interviews/{final_component}\0").into_bytes();
+            inline.extend_from_slice(b"payload after the path-like prefix");
+            let dump = [
+                archive_block().as_slice(),
+                file_header_block(1, name, inline.len() as u64, &inline).as_slice(),
+            ]
+            .concat();
+            let mut reader = BruFormat.open_dump_reader(std::io::Cursor::new(dump));
+            let mut sink = EventSink::default();
+
+            let report = reader.stream_all(&mut sink).unwrap();
+
+            assert_eq!(report.entries, 1, "{name}");
+            assert_eq!(report.archive_gaps, 0, "{name}");
+            assert_eq!(sink.entries[0].path, name);
+            assert_eq!(sink.entries[0].size_bytes, Some(inline.len() as u64));
+            assert_eq!(sink.data, inline, "{name}");
+        }
+    }
+
+    fn assert_refused_header_gap(gaps: &[ArchiveGapRange], label: &str) {
+        assert_eq!(gaps.len(), 2, "{label}");
+        assert_eq!(gaps[0].cause, ArchiveGapCause::UnrecognizedData, "{label}");
+        assert_eq!(gaps[0].source_start, BRU_BLOCK_SIZE as u64, "{label}");
+        assert_eq!(gaps[0].source_end, 2 * BRU_BLOCK_SIZE as u64, "{label}");
+        assert_eq!(gaps[1].cause, ArchiveGapCause::Resync, "{label}");
+        assert_eq!(gaps[1].source_start, 2 * BRU_BLOCK_SIZE as u64, "{label}");
+    }
+
+    fn long_path_payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 7 + 3) % 251) as u8).collect()
+    }
+
+    /// A long-path member in the observed layout: stand-in name, real path and
+    /// NUL at 0x400, 892 inline bytes after the NUL, then two continuations.
+    fn long_path_member(sequence: u64) -> Vec<u8> {
+        let payload = long_path_payload(LONG_SIZE);
+        let mut area = LONG_REAL_PATH.as_bytes().to_vec();
+        area.push(0);
+        area.extend_from_slice(&payload[..LONG_INLINE_LEN]);
+        assert_eq!(area.len(), INLINE_DATA_AREA_SIZE);
+        let header =
+            long_path_header_block(sequence, LONG_STAND_IN, &area, LONG_INLINE_LEN, LONG_SIZE);
+        [
+            header.as_slice(),
+            continuation_block(&payload[LONG_INLINE_LEN..LONG_INLINE_LEN + 1792]).as_slice(),
+            continuation_block(&payload[LONG_INLINE_LEN + 1792..]).as_slice(),
+        ]
+        .concat()
+    }
+
+    fn long_path_header_block(
+        sequence: u64,
+        stand_in: &str,
+        inline_area: &[u8],
+        inline_len: usize,
+        size: usize,
+    ) -> [u8; BRU_BLOCK_SIZE] {
+        let mut block = [0; BRU_BLOCK_SIZE];
+        put_ascii(&mut block, FILE_PATH_OFFSET, stand_in);
+        put_hex(&mut block, MAGIC_OFFSET, MAGIC_SIZE, MAGIC_FILE_HEADER);
+        put_hex(&mut block, FILE_SEQUENCE_OFFSET, 8, sequence);
+        put_hex(&mut block, INLINE_DATA_LEN_OFFSET, 4, inline_len as u64);
+        put_hex(&mut block, ST_MODE_OFFSET, 8, S_IFREG | 0o644);
+        put_hex(&mut block, ST_SIZE_OFFSET, 8, size as u64);
+        block[INLINE_DATA_OFFSET..INLINE_DATA_OFFSET + inline_area.len()]
+            .copy_from_slice(inline_area);
+        finalize_block(block)
     }
 
     fn put_ascii(block: &mut [u8; BRU_BLOCK_SIZE], offset: usize, text: &str) {
